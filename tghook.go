@@ -3,8 +3,10 @@ package tghook
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -18,16 +20,44 @@ type message struct {
 	id   int
 }
 
-func Run(ctx context.Context, channel string) error {
-	msgs, err := messages(channel, 0)
-	if err != nil {
-		return err
+func RunWithHook(ctx context.Context, channel string, wait time.Duration, url, method, data, filter, authUser, authPass string, header http.Header, upper, trim bool) error {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
 	}
-	minID := msgs[len(msgs)-1].id
+	re, err := regexp.Compile(filter)
+	if err != nil {
+		return fmt.Errorf("tghook: couldn't compile regex %s: %w", filter, err)
+	}
+	return Run(ctx, channel, wait, func(msg string, t time.Time) {
+		matches := re.FindStringSubmatch(msg)
+		if len(matches) < 1 {
+			return
+		}
+		data := data
+		for i, m := range matches[1:] {
+			if upper {
+				m = strings.ToUpper(m)
+			}
+			if trim {
+				m = strings.TrimSpace(m)
+			}
+			data = strings.ReplaceAll(data, fmt.Sprintf("$%d", i+1), m)
+		}
+		if err := webhook(client, url, method, data, authUser, authPass, header); err != nil {
+			log.Println(err)
+		}
+		log.Println("WEBHOOK", msg, t, data)
+	})
+}
+
+func Run(ctx context.Context, channel string, wait time.Duration, callback func(string, time.Time)) error {
+	minID := 0
+	first := true
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-time.After(500 * time.Millisecond):
 		default:
 		}
 		msgs, err := messages(channel, minID)
@@ -36,11 +66,16 @@ func Run(ctx context.Context, channel string) error {
 			continue
 		}
 		for _, m := range msgs {
-			fmt.Println(m.id, m.time, m.text)
+			if m.id > minID {
+				minID = m.id
+			}
+			if first {
+				continue
+			}
+			log.Println("MSG", m.id, m.time, m.text)
+			go callback(m.text, m.time)
 		}
-		if len(msgs) > 0 {
-			minID = msgs[len(msgs)-1].id
-		}
+		first = false
 	}
 }
 
@@ -51,26 +86,26 @@ func messages(channel string, minID int) ([]message, error) {
 	}
 	r, err := client.Get(u)
 	if err != nil {
-		return nil, fmt.Errorf("get request failed: %w", err)
+		return nil, fmt.Errorf("tghook: get request failed: %w", err)
 	}
 	if r.StatusCode != 200 {
-		return nil, fmt.Errorf("invalid status code: %s", r.Status)
+		return nil, fmt.Errorf("tghook: invalid status code: %s", r.Status)
 	}
 	defer r.Body.Close()
 	doc, err := goquery.NewDocumentFromReader(r.Body)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't create document: %w", err)
+		return nil, fmt.Errorf("tghook: couldn't create document: %w", err)
 	}
 
 	var msgs []message
 	doc.Find(".tgme_widget_message_wrap").Each(func(i int, s *goquery.Selection) {
 		var msg message
-		s.Find(".tgme_widget_message_text").EachWithBreak(func(i int, s *goquery.Selection) bool {
-			msg.text = s.Text()
+		s.Find(".tgme_widget_message_text").EachWithBreak(func(i int, s1 *goquery.Selection) bool {
+			msg.text = s1.Text()
 			return false
 		})
-		s.Find(".tgme_widget_message_info time").EachWithBreak(func(i int, s *goquery.Selection) bool {
-			val, ok := s.Attr("datetime")
+		s.Find(".tgme_widget_message_info time").EachWithBreak(func(i int, s2 *goquery.Selection) bool {
+			val, ok := s2.Attr("datetime")
 			if !ok {
 				return true
 			}
@@ -78,21 +113,21 @@ func messages(channel string, minID int) ([]message, error) {
 			var err error
 			msg.time, err = time.Parse("2006-01-02T15:04:05", val)
 			if err != nil {
-				log.Println(fmt.Sprintf("couldn't parse timestamp %s: %v", val, err))
+				log.Println(fmt.Sprintf("tghook: couldn't parse timestamp %s: %v", val, err))
 				return true
 			}
 			return false
 		})
-		s.Find(".tgme_widget_message").EachWithBreak(func(i int, s *goquery.Selection) bool {
-			val, ok := s.Attr("data-post")
+		s.Find(".tgme_widget_message").EachWithBreak(func(i int, s3 *goquery.Selection) bool {
+			val, ok := s3.Attr("data-post")
 			if !ok {
 				return true
 			}
-			val = strings.TrimLeft(val, fmt.Sprintf("%s/", channel))
+			val = strings.TrimPrefix(val, fmt.Sprintf("%s/", channel))
 			var err error
 			msg.id, err = strconv.Atoi(val)
 			if err != nil {
-				log.Println(fmt.Sprintf("couldn't parse int %s: %v", val, err))
+				log.Println(fmt.Sprintf("tghook: couldn't parse int %s: %v", val, err))
 				return true
 			}
 			return false
@@ -103,4 +138,29 @@ func messages(channel string, minID int) ([]message, error) {
 		msgs = append(msgs, msg)
 	})
 	return msgs, nil
+}
+
+func webhook(client *http.Client, url, method, data, authUser, authPass string, header http.Header) error {
+	fmt.Println(data)
+	return nil
+	var body io.Reader
+	if data != "" {
+		body = strings.NewReader(data)
+	}
+	req, err := http.NewRequest(method, url, body)
+	req.Header = header
+	if authUser != "" {
+		req.SetBasicAuth(authUser, authPass)
+	}
+	if err != nil {
+		return fmt.Errorf("tghook: couldn't create request: %w", err)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("tghook: request failed: %w", err)
+	}
+	if res.StatusCode != 200 {
+		return fmt.Errorf("tghook: invalid status code: %s", res.Status)
+	}
+	return nil
 }
