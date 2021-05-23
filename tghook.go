@@ -141,8 +141,6 @@ func messages(channel string, minID int) ([]message, error) {
 }
 
 func webhook(client *http.Client, url, method, data, authUser, authPass string, header http.Header) error {
-	fmt.Println(data)
-	return nil
 	var body io.Reader
 	if data != "" {
 		body = strings.NewReader(data)
