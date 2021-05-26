@@ -24,6 +24,15 @@ func RunWithHook(ctx context.Context, channel string, wait time.Duration, url, m
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
+	return RunWithFilter(ctx, channel, wait, filter, data, upper, trim, func(msg string, t time.Time) {
+		if err := webhook(client, url, method, data, authUser, authPass, header); err != nil {
+			log.Println(err)
+		}
+		log.Println("WEBHOOK", msg, t, data)
+	})
+}
+
+func RunWithFilter(ctx context.Context, channel string, wait time.Duration, filter, data string, upper, trim bool, callback func(string, time.Time)) error {
 	re, err := regexp.Compile(filter)
 	if err != nil {
 		return fmt.Errorf("tghook: couldn't compile regex %s: %w", filter, err)
@@ -43,10 +52,7 @@ func RunWithHook(ctx context.Context, channel string, wait time.Duration, url, m
 			}
 			data = strings.ReplaceAll(data, fmt.Sprintf("$%d", i+1), m)
 		}
-		if err := webhook(client, url, method, data, authUser, authPass, header); err != nil {
-			log.Println(err)
-		}
-		log.Println("WEBHOOK", msg, t, data)
+		callback(data, t)
 	})
 }
 
