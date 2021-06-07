@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/robfig/cron/v3"
 )
 
 type message struct {
@@ -83,6 +84,36 @@ func Run(ctx context.Context, channel string, wait time.Duration, callback func(
 		}
 		first = false
 	}
+}
+
+type Schedule struct {
+	Channel string
+	Spec    string
+	Timeout int
+	URL     string
+	Filter  string
+}
+
+func RunSchedule(ctx context.Context, schedules []Schedule) error {
+	crn := cron.New()
+	for _, s := range schedules {
+		log.Printf("scheduled hook of channel %s at %s\n", s.Channel, s.Spec)
+		crn.AddFunc(s.Spec, func() {
+			log.Printf("start hook of channel %s\n", s.Channel)
+			defer log.Printf("end hook of channel %s\n", s.Channel)
+			ctx, cancel := context.WithTimeout(ctx, time.Duration(s.Timeout)*time.Minute)
+			defer cancel()
+			if err := RunWithHook(ctx, s.Channel, 100*time.Millisecond, s.URL, "GET", "", s.Filter, "", "", http.Header{}, false, false); err != nil {
+				log.Println(err)
+			}
+		})
+	}
+	crn.Start()
+	log.Println("cron started")
+	<-ctx.Done()
+	crn.Stop()
+	log.Println("cron finished")
+	return nil
 }
 
 func messages(channel string, minID int) ([]message, error) {
